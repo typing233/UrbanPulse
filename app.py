@@ -1,12 +1,11 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import date as date_type, datetime, timedelta
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from typing import Dict, Optional
-import json
+from typing import Dict
 
 from data_generator import CityDataGenerator, generate_data_for_cities, get_current_status
 
@@ -389,7 +388,7 @@ def create_comparison_chart(
     return fig
 
 
-def render_city_column(city: str, col, selected_date: datetime, data_type: str):
+def render_city_column(city: str, col, selected_date: date_type, data_type: str):
     """渲染单个城市的列"""
     generator = st.session_state.data_generator
     
@@ -428,7 +427,7 @@ def render_city_column(city: str, col, selected_date: datetime, data_type: str):
     # AQI
     aqi_value = current_data['aqi']
     aqi_color = get_aqi_color(aqi_value)
-    aqi_level, aqi_hex = current_data['aqi_level']
+    aqi_level = current_data['aqi_level'][0]
     
     metric_col2.markdown(f"""
     <div class="metric-card">
@@ -599,7 +598,8 @@ def test_llm_connection(base_url: str, api_key: str, model_name: str) -> bool:
         
         return True
     except Exception as e:
-        st.error(f"连接错误: {str(e)}")
+        import logging
+        logging.warning("LLM connection test failed: %s", e)
         return False
 
 
@@ -738,7 +738,7 @@ def main():
     
     # 确保开始日期不晚于结束日期
     if compare_start > compare_end:
-        st.error("开始日期不能晚于结束日期")
+        st.warning("开始日期不能晚于结束日期，已自动调换")
         compare_start, compare_end = compare_end, compare_start
     
     # 创建并显示对比图

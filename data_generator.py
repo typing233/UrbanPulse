@@ -211,6 +211,13 @@ class CityDataGenerator:
         districts = self.DISTRICT_CONFIG[city]
         city_config = self.CITY_CONFIG[city]
         
+        # 使用日期和城市名生成确定性随机种子，确保同一日期结果一致
+        if hasattr(date, 'toordinal'):
+            date_seed = date.toordinal()
+        else:
+            date_seed = date.date().toordinal()
+        rng = np.random.default_rng(hash(f'{city}_{date_seed}') % (2**32))
+        
         data = []
         for district in districts:
             # 基于区域权重和城市基础数据计算
@@ -218,8 +225,8 @@ class CityDataGenerator:
             aqi_base = city_config['base_aqi'] * district['weight']
             
             # 添加一些随机性
-            traffic = traffic_base + np.random.normal(0, 10)
-            aqi = aqi_base + np.random.normal(0, 15)
+            traffic = traffic_base + rng.normal(0, 10)
+            aqi = aqi_base + rng.normal(0, 15)
             
             data.append({
                 'district': district['name'],
