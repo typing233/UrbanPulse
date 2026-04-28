@@ -439,15 +439,22 @@ def render_city_column(city: str, col, selected_date: datetime, data_type: str):
     """, unsafe_allow_html=True)
     
     # 地图标签页
-    tab1, tab2 = col.tabs(["📍 交通拥堵地图", "🌬️ 空气质量地图"])
-    
-    with tab1:
+    if data_type == "交通拥堵指数":
+        col.markdown("#### 📍 交通拥堵地图")
         traffic_map = create_traffic_map(city, district_data)
         col.plotly_chart(traffic_map, use_container_width=True, key=f"traffic_{city}")
-    
-    with tab2:
+    elif data_type == "空气质量AQI":
+        col.markdown("#### 🌬️ 空气质量地图")
         aqi_map = create_aqi_map(city, district_data)
         col.plotly_chart(aqi_map, use_container_width=True, key=f"aqi_{city}")
+    else:
+        tab1, tab2 = col.tabs(["📍 交通拥堵地图", "🌬️ 空气质量地图"])
+        with tab1:
+            traffic_map = create_traffic_map(city, district_data)
+            st.plotly_chart(traffic_map, use_container_width=True, key=f"traffic_{city}")
+        with tab2:
+            aqi_map = create_aqi_map(city, district_data)
+            st.plotly_chart(aqi_map, use_container_width=True, key=f"aqi_{city}")
     
     # 历史趋势图
     col.markdown("### 📈 历史数据趋势")
