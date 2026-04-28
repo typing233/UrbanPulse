@@ -141,6 +141,7 @@ def create_traffic_map(city: str, district_data: pd.DataFrame) -> go.Figure:
     
     fig.update_layout(
         mapbox_style='carto-positron',
+        height=250,
         margin={'r': 0, 't': 0, 'l': 0, 'b': 0},
         coloraxis_colorbar={
             'title': '拥堵指数',
@@ -185,6 +186,7 @@ def create_aqi_map(city: str, district_data: pd.DataFrame) -> go.Figure:
     
     fig.update_layout(
         mapbox_style='carto-positron',
+        height=250,
         margin={'r': 0, 't': 0, 'l': 0, 'b': 0},
         coloraxis_colorbar={
             'title': 'AQI',
@@ -199,13 +201,22 @@ def create_aqi_map(city: str, district_data: pd.DataFrame) -> go.Figure:
 def create_time_series_chart(
     city_data: pd.DataFrame,
     city_name: str,
-    start_date: datetime,
-    end_date: datetime
+    start_date,
+    end_date
 ) -> go.Figure:
     """创建时序折线图"""
+    # 统一日期类型处理（支持 datetime.date 和 datetime.datetime）
+    def to_date(d):
+        if hasattr(d, 'date'):
+            return d.date()
+        return d
+    
+    start_date_ = to_date(start_date)
+    end_date_ = to_date(end_date)
+    
     # 筛选日期范围
-    mask = (city_data['timestamp'].dt.date >= start_date.date()) & \
-           (city_data['timestamp'].dt.date <= end_date.date())
+    mask = (city_data['timestamp'].dt.date >= start_date_) & \
+           (city_data['timestamp'].dt.date <= end_date_)
     filtered_data = city_data.loc[mask]
     
     # 创建子图
@@ -258,15 +269,16 @@ def create_time_series_chart(
     
     # 更新布局
     fig.update_layout(
-        height=400,
+        height=280,
         showlegend=False,
         title_text=f'{city_name} - 历史数据趋势',
-        title_x=0.5
+        title_x=0.5,
+        margin=dict(l=10, r=10, t=40, b=10)
     )
     
-    fig.update_xaxes(title_text='时间', row=2, col=1)
-    fig.update_yaxes(title_text='拥堵指数 (0-100)', row=1, col=1, range=[0, 100])
-    fig.update_yaxes(title_text='AQI (0-500)', row=2, col=1, range=[0, 250])
+    fig.update_xaxes(title_text='', row=2, col=1)
+    fig.update_yaxes(title_text='拥堵指数', row=1, col=1, range=[0, 100])
+    fig.update_yaxes(title_text='AQI', row=2, col=1, range=[0, 250])
     
     return fig
 
@@ -274,15 +286,24 @@ def create_time_series_chart(
 def create_comparison_chart(
     beijing_data: pd.DataFrame,
     shanghai_data: pd.DataFrame,
-    start_date: datetime,
-    end_date: datetime
+    start_date,
+    end_date
 ) -> go.Figure:
     """创建两城市对比图"""
+    # 统一日期类型处理
+    def to_date(d):
+        if hasattr(d, 'date'):
+            return d.date()
+        return d
+    
+    start_date_ = to_date(start_date)
+    end_date_ = to_date(end_date)
+    
     # 筛选日期
-    mask_bj = (beijing_data['timestamp'].dt.date >= start_date.date()) & \
-              (beijing_data['timestamp'].dt.date <= end_date.date())
-    mask_sh = (shanghai_data['timestamp'].dt.date >= start_date.date()) & \
-              (shanghai_data['timestamp'].dt.date <= end_date.date())
+    mask_bj = (beijing_data['timestamp'].dt.date >= start_date_) & \
+              (beijing_data['timestamp'].dt.date <= end_date_)
+    mask_sh = (shanghai_data['timestamp'].dt.date >= start_date_) & \
+              (shanghai_data['timestamp'].dt.date <= end_date_)
     
     bj_filtered = beijing_data.loc[mask_bj]
     sh_filtered = shanghai_data.loc[mask_sh]
@@ -349,9 +370,10 @@ def create_comparison_chart(
     )
     
     fig.update_layout(
-        height=350,
+        height=250,
         title_text='北京 vs 上海 对比分析',
         title_x=0.5,
+        margin=dict(l=10, r=10, t=40, b=10),
         legend=dict(
             orientation='h',
             yanchor='bottom',
