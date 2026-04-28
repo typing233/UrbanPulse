@@ -228,7 +228,7 @@ class CityDataGenerator:
                 'traffic_index': round(max(0, min(100, traffic)), 1),
                 'aqi': round(max(0, min(500, aqi)), 0),
                 'traffic_level': self._get_traffic_level(traffic),
-                'aqi_level': self._get_aqi_level(aqi)
+                'aqi_level': self._get_aqi_level(aqi)[0]
             })
         
         return pd.DataFrame(data)
