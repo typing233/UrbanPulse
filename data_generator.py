@@ -216,7 +216,7 @@ class CityDataGenerator:
             date_seed = date.toordinal()
         else:
             date_seed = date.date().toordinal()
-        rng = np.random.default_rng(hash(city) % (2**32) ^ date_seed)
+        rng = np.random.default_rng(hash(f'{city}_{date_seed}') % (2**32))
         
         data = []
         for district in districts:

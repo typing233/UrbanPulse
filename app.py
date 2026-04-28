@@ -597,7 +597,9 @@ def test_llm_connection(base_url: str, api_key: str, model_name: str) -> bool:
         )
         
         return True
-    except Exception:
+    except Exception as e:
+        import logging
+        logging.warning("LLM connection test failed: %s", e)
         return False
 
 
