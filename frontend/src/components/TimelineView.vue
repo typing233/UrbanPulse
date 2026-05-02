@@ -4,16 +4,16 @@
       <h2>{{ city }} - 24小时数据演变</h2>
       <div class="time-indicator">
         当前时间: <span class="highlight">{{ currentTime }}</span>
-        <span class="time-marker" :style="{ left: timeMarkerPosition + '%' }"></span>
       </div>
     </div>
 
-    <div class="scrollytelling-container" ref="scrollContainer">
+    <div class="scrollytelling-container">
       <div class="canvas-wrapper">
         <canvas ref="particleCanvas" class="particle-canvas"></canvas>
+        <canvas ref="trailCanvas" class="trail-canvas"></canvas>
         <div class="canvas-overlay">
           <div class="current-hour-label">
-            {{ Math.floor(currentHour) }}:00
+            {{ Math.floor(currentHour) }}:{{ String(Math.floor((currentHour % 1) * 60)).padStart(2, '0') }}
           </div>
         </div>
       </div>
@@ -24,7 +24,7 @@
           :key="index"
           class="step-section"
           :class="{ active: activeStep === index }"
-          :style="{ transform: `translateY(${(index - activeStep) * 50}px)`, opacity: activeStep === index ? 1 : 0.5 }"
+          @click="jumpToStep(step.hour)"
         >
           <div class="step-content">
             <h3>{{ step.title }}</h3>
@@ -54,7 +54,7 @@
           type="range" 
           min="0" 
           max="24" 
-          step="0.5"
+          step="0.01"
           v-model="currentHour"
           class="time-slider"
         />
@@ -73,6 +73,9 @@
         <button @click="resetTimeline" class="reset-btn">
           🔄 重置
         </button>
+        <button @click="toggleSlowMotion" class="speed-btn" :class="{ active: slowMotion }">
+          {{ slowMotion ? '⏩ 正常' : '⏱️ 慢放' }}
+        </button>
       </div>
     </div>
   </div>
@@ -90,17 +93,24 @@ const props = defineProps({
 })
 
 const particleCanvas = ref(null)
-const scrollContainer = ref(null)
+const trailCanvas = ref(null)
 
 const hourlyData = ref([])
 const currentHour = ref(0)
 const isPlaying = ref(false)
+const slowMotion = ref(false)
 const activeStep = ref(0)
 
 let animationFrameId = null
 let playInterval = null
-let canvasContext = null
-let particleSystem = null
+let mainCtx = null
+let trailCtx = null
+let canvasWidth = 0
+let canvasHeight = 0
+
+let velocityField = null
+let particles = []
+let time = 0
 
 const steps = computed(() => {
   const baseSteps = [
@@ -128,10 +138,6 @@ const currentTime = computed(() => {
   const hour = Math.floor(currentHour.value)
   const minute = Math.floor((currentHour.value % 1) * 60)
   return `${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')}`
-})
-
-const timeMarkerPosition = computed(() => {
-  return (currentHour.value / 24) * 100
 })
 
 const getTrafficClass = (value) => {
@@ -166,205 +172,431 @@ const getColorForValue = (value, type = 'traffic') => {
   }
 }
 
-class Particle {
-  constructor(x, y, canvasWidth, canvasHeight) {
+const initVelocityField = () => {
+  const gridSize = 20
+  const cellSizeX = canvasWidth / gridSize
+  const cellSizeY = canvasHeight / gridSize
+  
+  velocityField = {
+    gridSize,
+    cellSizeX,
+    cellSizeY,
+    velocities: []
+  }
+  
+  for (let y = 0; y < gridSize; y++) {
+    velocityField.velocities[y] = []
+    for (let x = 0; x < gridSize; x++) {
+      const flowAngles = getFlowAnglesForPosition(x, y, gridSize)
+      velocityField.velocities[y][x] = {
+        baseVx: Math.cos(flowAngles.angle1) * flowAngles.strength1,
+        baseVy: Math.sin(flowAngles.angle1) * flowAngles.strength1,
+        secondaryVx: Math.cos(flowAngles.angle2) * flowAngles.strength2,
+        secondaryVy: Math.sin(flowAngles.angle2) * flowAngles.strength2
+      }
+    }
+  }
+}
+
+const getFlowAnglesForPosition = (x, y, gridSize) => {
+  const centerX = gridSize / 2
+  const centerY = gridSize / 2
+  
+  const dx = x - centerX
+  const dy = y - centerY
+  
+  const distance = Math.sqrt(dx * dx + dy * dy)
+  
+  let angle1 = 0
+  let strength1 = 1
+  let angle2 = 0
+  let strength2 = 0.5
+  
+  if (distance < 3) {
+    angle1 = (dx < 0 ? Math.PI : 0) + (dy < 0 ? Math.PI / 4 : -Math.PI / 4)
+    strength1 = 1.5
+  } else if (x < gridSize * 0.25) {
+    angle1 = Math.PI / 6
+    strength1 = 1.2
+  } else if (x > gridSize * 0.75) {
+    angle1 = -Math.PI / 6
+    strength1 = 1.2
+  } else if (y < gridSize * 0.25) {
+    angle1 = Math.PI / 3
+    strength1 = 1.0
+  } else if (y > gridSize * 0.75) {
+    angle1 = -Math.PI / 3
+    strength1 = 1.0
+  } else {
+    angle1 = (dx > 0 ? -0.2 : 0.2)
+    strength1 = 0.8
+  }
+  
+  angle2 = angle1 + Math.PI / 2 + Math.sin(time * 0.5) * 0.3
+  
+  return { angle1, strength1, angle2, strength2 }
+}
+
+const getVelocityAt = (x, y, hourProgress, trafficMultiplier) => {
+  if (!velocityField) return { vx: 0, vy: 0 }
+  
+  const gridX = Math.floor(x / velocityField.cellSizeX)
+  const gridY = Math.floor(y / velocityField.cellSizeY)
+  
+  const clampedX = Math.max(0, Math.min(velocityField.gridSize - 1, gridX))
+  const clampedY = Math.max(0, Math.min(velocityField.gridSize - 1, gridY))
+  
+  const velocity = velocityField.velocities[clampedY][clampedX]
+  
+  const t = hourProgress * Math.PI * 2
+  const swirlFactor = Math.sin(t) * 0.3 + Math.cos(t * 1.5) * 0.2
+  
+  const timeVaryingVx = velocity.baseVx + velocity.secondaryVx * swirlFactor
+  const timeVaryingVy = velocity.baseVy + velocity.secondaryVy * swirlFactor
+  
+  const distToCenterX = Math.abs(x - canvasWidth / 2) / (canvasWidth / 2)
+  const distToCenterY = Math.abs(y - canvasHeight / 2) / (canvasHeight / 2)
+  const edgeBoost = 1 + (distToCenterX + distToCenterY) * 0.5
+  
+  return {
+    vx: timeVaryingVx * trafficMultiplier * edgeBoost,
+    vy: timeVaryingVy * trafficMultiplier * edgeBoost
+  }
+}
+
+class FluidParticle {
+  constructor(x, y) {
     this.x = x
     this.y = y
-    this.vx = (Math.random() - 0.5) * 2
-    this.vy = (Math.random() - 0.5) * 2
-    this.radius = Math.random() * 3 + 1
-    this.baseRadius = this.radius
-    this.canvasWidth = canvasWidth
-    this.canvasHeight = canvasHeight
-    this.trafficValue = 50
-    this.aqiValue = 50
-    this.alpha = 0.5 + Math.random() * 0.5
-    this.baseAlpha = this.alpha
+    this.vx = 0
+    this.vy = 0
+    
+    this.trail = []
+    this.maxTrailLength = 40
+    
+    this.baseRadius = 1.5 + Math.random() * 2.5
+    this.radius = this.baseRadius
+    
+    this.hue = 0.5 + Math.random() * 0.2
+    this.saturation = 0.8
+    this.baseAlpha = 0.6 + Math.random() * 0.3
+    
+    this.lifeTime = Math.random() * 1000
+    this.type = Math.random() > 0.7 ? 'fast' : 'normal'
+    
+    this.targetX = x
+    this.targetY = y
   }
-
-  update(hourProgress, trafficValue, aqiValue) {
-    this.trafficValue = trafficValue
-    this.aqiValue = aqiValue
-
-    const speedFactor = 0.3 + (trafficValue / 100) * 1.5
-    this.x += this.vx * speedFactor
-    this.y += this.vy * speedFactor
-
-    if (this.x < 0) this.x = this.canvasWidth
-    if (this.x > this.canvasWidth) this.x = 0
-    if (this.y < 0) this.y = this.canvasHeight
-    if (this.y > this.canvasHeight) this.y = 0
-
-    const pulseFactor = 0.5 + Math.sin(Date.now() * 0.003 + this.x * 0.1) * 0.5
-    this.radius = this.baseRadius * (1 + (trafficValue / 100) * 0.5 * pulseFactor)
-    this.alpha = this.baseAlpha * (0.5 + (aqiValue / 200) * 0.5)
+  
+  update(hourProgress, trafficValue, aqiValue, dt) {
+    this.lifeTime += dt
+    
+    const trafficMultiplier = 0.3 + (trafficValue / 100) * 1.5
+    const velocity = getVelocityAt(this.x, this.y, hourProgress, trafficMultiplier)
+    
+    const accelerationX = velocity.vx - this.vx
+    const accelerationY = velocity.vy - this.vy
+    
+    const damping = this.type === 'fast' ? 0.15 : 0.1
+    this.vx += accelerationX * damping
+    this.vy += accelerationY * damping
+    
+    const turbulence = (Math.random() - 0.5) * 0.5 * trafficMultiplier
+    this.vx += turbulence
+    this.vy += turbulence
+    
+    const maxSpeed = this.type === 'fast' ? 6 : 3.5
+    const speed = Math.sqrt(this.vx * this.vx + this.vy * this.vy)
+    if (speed > maxSpeed) {
+      const scale = maxSpeed / speed
+      this.vx *= scale
+      this.vy *= scale
+    }
+    
+    this.x += this.vx * dt
+    this.y += this.vy * dt
+    
+    if (this.x < 0) this.x = canvasWidth
+    if (this.x > canvasWidth) this.x = 0
+    if (this.y < 0) this.y = canvasHeight
+    if (this.y > canvasHeight) this.y = 0
+    
+    if (this.trail.length === 0 || 
+        Math.abs(this.x - this.trail[this.trail.length - 1].x) > 0.5 ||
+        Math.abs(this.y - this.trail[this.trail.length - 1].y) > 0.5) {
+      this.trail.push({
+        x: this.x,
+        y: this.y,
+        age: 0
+      })
+    }
+    
+    if (this.trail.length > this.maxTrailLength) {
+      this.trail.shift()
+    }
+    
+    this.trail.forEach(point => {
+      point.age += dt
+    })
+    
+    const pulse = 0.8 + Math.sin(this.lifeTime * 0.003 + this.x * 0.01) * 0.2
+    this.radius = this.baseRadius * pulse * (0.8 + (trafficValue / 100) * 0.4)
+    
+    const trafficColor = getColorForValue(trafficValue, 'traffic')
+    const aqiColor = getColorForValue(aqiValue, 'aqi')
+    
+    const colorMix = hourProgress
+    this.r = Math.floor(trafficColor.r * (1 - colorMix) + aqiColor.r * colorMix)
+    this.g = Math.floor(trafficColor.g * (1 - colorMix) + aqiColor.g * colorMix)
+    this.b = Math.floor(trafficColor.b * (1 - colorMix) + aqiColor.b * colorMix)
   }
-
-  draw(ctx, hourProgress) {
-    const trafficColor = getColorForValue(this.trafficValue, 'traffic')
-    const aqiColor = getColorForValue(this.aqiValue, 'aqi')
-
-    const r = Math.floor(trafficColor.r * (1 - hourProgress) + aqiColor.r * hourProgress)
-    const g = Math.floor(trafficColor.g * (1 - hourProgress) + aqiColor.g * hourProgress)
-    const b = Math.floor(trafficColor.b * (1 - hourProgress) + aqiColor.b * hourProgress)
-
-    ctx.beginPath()
-    ctx.arc(this.x, this.y, this.radius, 0, Math.PI * 2)
-    ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${this.alpha})`
-    ctx.fill()
-
-    ctx.beginPath()
-    ctx.arc(this.x, this.y, this.radius * 1.5, 0, Math.PI * 2)
+  
+  drawTrail(ctx) {
+    if (this.trail.length < 3) return
+    
+    for (let i = 1; i < this.trail.length; i++) {
+      const prevPoint = this.trail[i - 1]
+      const currentPoint = this.trail[i]
+      
+      const progress = i / this.trail.length
+      const alpha = progress * this.baseAlpha
+      const width = this.radius * 0.8 * progress
+      
+      ctx.beginPath()
+      ctx.moveTo(prevPoint.x, prevPoint.y)
+      ctx.lineTo(currentPoint.x, currentPoint.y)
+      
+      const gradient = ctx.createLinearGradient(
+        prevPoint.x, prevPoint.y,
+        currentPoint.x, currentPoint.y
+      )
+      gradient.addColorStop(0, `rgba(${this.r}, ${this.g}, ${this.b}, ${alpha * 0.3})`)
+      gradient.addColorStop(1, `rgba(${this.r}, ${this.g}, ${this.b}, ${alpha})`)
+      
+      ctx.strokeStyle = gradient
+      ctx.lineWidth = width
+      ctx.lineCap = 'round'
+      ctx.stroke()
+    }
+  }
+  
+  drawParticle(ctx) {
+    const speed = Math.sqrt(this.vx * this.vx + this.vy * this.vy)
+    const speedFactor = Math.min(1, speed / 4)
+    
+    const glowRadius = this.radius * (2 + speedFactor)
     const gradient = ctx.createRadialGradient(
       this.x, this.y, 0,
-      this.x, this.y, this.radius * 1.5
+      this.x, this.y, glowRadius
     )
-    gradient.addColorStop(0, `rgba(${r}, ${g}, ${b}, ${this.alpha * 0.5})`)
-    gradient.addColorStop(1, `rgba(${r}, ${g}, ${b}, 0)`)
+    
+    const alpha = this.baseAlpha * (0.5 + speedFactor * 0.5)
+    gradient.addColorStop(0, `rgba(${this.r}, ${this.g}, ${this.b}, ${alpha})`)
+    gradient.addColorStop(0.3, `rgba(${this.r}, ${this.g}, ${this.b}, ${alpha * 0.5})`)
+    gradient.addColorStop(1, `rgba(${this.r}, ${this.g}, ${this.b}, 0)`)
+    
+    ctx.beginPath()
+    ctx.arc(this.x, this.y, glowRadius, 0, Math.PI * 2)
     ctx.fillStyle = gradient
+    ctx.fill()
+    
+    ctx.beginPath()
+    ctx.arc(this.x, this.y, this.radius, 0, Math.PI * 2)
+    ctx.fillStyle = `rgba(255, 255, 255, ${this.baseAlpha * 0.8})`
     ctx.fill()
   }
 }
 
 const initCanvas = () => {
-  if (!particleCanvas.value) return
+  if (!particleCanvas.value || !trailCanvas.value) return
 
   const canvas = particleCanvas.value
+  const trail = trailCanvas.value
   const container = canvas.parentElement
 
-  canvas.width = container.clientWidth
-  canvas.height = container.clientHeight
+  canvasWidth = container.clientWidth
+  canvasHeight = container.clientHeight
 
-  canvasContext = canvas.getContext('2d')
+  canvas.width = canvasWidth
+  canvas.height = canvasHeight
+  trail.width = canvasWidth
+  trail.height = canvasHeight
 
-  particleSystem = {
-    particles: [],
-    width: canvas.width,
-    height: canvas.height
-  }
+  mainCtx = canvas.getContext('2d')
+  trailCtx = trail.getContext('2d')
 
-  const particleCount = 200
+  initVelocityField()
+  initParticles()
+}
+
+const initParticles = () => {
+  particles = []
+  const particleCount = 250
+  
   for (let i = 0; i < particleCount; i++) {
-    const x = Math.random() * canvas.width
-    const y = Math.random() * canvas.height
-    particleSystem.particles.push(new Particle(x, y, canvas.width, canvas.height))
+    const x = Math.random() * canvasWidth
+    const y = Math.random() * canvasHeight
+    particles.push(new FluidParticle(x, y))
   }
 }
 
-const drawFluidEffect = (ctx, hourProgress, trafficValue, aqiValue) => {
-  if (!particleSystem) return
-
-  const gradient = ctx.createLinearGradient(
-    0, 0, 
-    particleSystem.width, particleSystem.height
-  )
+const drawBackground = (ctx, hourProgress, trafficValue, aqiValue) => {
+  const hour = hourProgress * 24
+  let bgColor1, bgColor2
   
-  const hourColor = getHourColor(hourProgress)
-  gradient.addColorStop(0, `rgba(${hourColor.r}, ${hourColor.g}, ${hourColor.b}, 0.1)`)
-  gradient.addColorStop(1, `rgba(${hourColor.r + 20}, ${hourColor.g + 20}, ${hourColor.b + 40}, 0.1)`)
+  if (hour >= 6 && hour < 8) {
+    const t = (hour - 6) / 2
+    bgColor1 = `rgb(${Math.floor(10 + t * 20)}, ${Math.floor(15 + t * 30)}, ${Math.floor(30 + t * 40)})`
+    bgColor2 = `rgb(${Math.floor(20 + t * 40)}, ${Math.floor(25 + t * 50)}, ${Math.floor(50 + t * 60)})`
+  } else if (hour >= 8 && hour < 17) {
+    bgColor1 = 'rgb(30, 45, 70)'
+    bgColor2 = 'rgb(60, 75, 110)'
+  } else if (hour >= 17 && hour < 19) {
+    const t = (hour - 17) / 2
+    bgColor1 = `rgb(${Math.floor(30 - t * 20)}, ${Math.floor(45 - t * 30)}, ${Math.floor(70 - t * 40)})`
+    bgColor2 = `rgb(${Math.floor(60 - t * 40)}, ${Math.floor(75 - t * 50)}, ${Math.floor(110 - t * 60)})`
+  } else {
+    bgColor1 = 'rgb(10, 15, 30)'
+    bgColor2 = 'rgb(20, 25, 50)'
+  }
+  
+  const gradient = ctx.createLinearGradient(0, 0, canvasWidth, canvasHeight)
+  gradient.addColorStop(0, bgColor1)
+  gradient.addColorStop(1, bgColor2)
   
   ctx.fillStyle = gradient
-  ctx.fillRect(0, 0, particleSystem.width, particleSystem.height)
+  ctx.fillRect(0, 0, canvasWidth, canvasHeight)
+  
+  drawFlowLines(ctx, hourProgress, trafficValue)
+}
 
-  const flowLines = 20
-  for (let i = 0; i < flowLines; i++) {
-    const y = (i / flowLines) * particleSystem.height
-    const waveOffset = Math.sin(Date.now() * 0.002 + i * 0.5) * 20
-    const flowSpeed = (trafficValue / 100) * 3
-
+const drawFlowLines = (ctx, hourProgress, trafficValue) => {
+  const lineCount = 15
+  const trafficMultiplier = 0.3 + (trafficValue / 100) * 1.5
+  
+  for (let i = 0; i < lineCount; i++) {
+    const y = (i / lineCount) * canvasHeight
+    
     ctx.beginPath()
     ctx.moveTo(0, y)
     
-    for (let x = 0; x < particleSystem.width; x += 10) {
-      const waveY = y + Math.sin((x + Date.now() * 0.001 * flowSpeed) * 0.05) * 10 + waveOffset
+    for (let x = 0; x < canvasWidth; x += 5) {
+      const velocity = getVelocityAt(x, y, hourProgress, trafficMultiplier)
+      const waveY = y + velocity.vy * 3 + Math.sin((x + time * 50) * 0.01) * 15
       ctx.lineTo(x, waveY)
     }
-
-    const lineColor = getColorForValue(trafficValue, 'traffic')
-    ctx.strokeStyle = `rgba(${lineColor.r}, ${lineColor.g}, ${lineColor.b}, 0.3)`
+    
+    const trafficColor = getColorForValue(trafficValue, 'traffic')
+    const alpha = 0.1 + (i / lineCount) * 0.15
+    
+    ctx.strokeStyle = `rgba(${trafficColor.r}, ${trafficColor.g}, ${trafficColor.b}, ${alpha})`
     ctx.lineWidth = 1
     ctx.stroke()
-  }
-
-  particleSystem.particles.forEach(particle => {
-    particle.update(hourProgress, trafficValue, aqiValue)
-    particle.draw(ctx, hourProgress)
-  })
-
-  drawTimeDistribution(ctx, hourProgress)
-}
-
-const getHourColor = (hourProgress) => {
-  const hour = hourProgress * 24
-  
-  if (hour >= 6 && hour < 18) {
-    return { r: 20, g: 30, b: 60 }
-  } else {
-    return { r: 10, g: 15, b: 40 }
   }
 }
 
 const drawTimeDistribution = (ctx, hourProgress) => {
-  if (!particleSystem) return
-
-  const barWidth = particleSystem.width / 24
-  const maxBarHeight = particleSystem.height * 0.15
-
+  const barWidth = canvasWidth / 24
+  const maxBarHeight = canvasHeight * 0.12
+  const bottomY = canvasHeight - maxBarHeight - 30
+  
   ctx.save()
-  ctx.translate(0, particleSystem.height - maxBarHeight - 20)
-
+  
   for (let hour = 0; hour < 24; hour++) {
     const hourData = hourlyData.value.find(d => Math.floor(d.hour) === hour)
     const trafficValue = hourData?.traffic_index || 50
     const barHeight = (trafficValue / 100) * maxBarHeight
-
+    
     const x = hour * barWidth
     
     const isCurrentHour = Math.abs(hour - hourProgress * 24) < 0.5
+    const isNearHour = Math.abs(hour - hourProgress * 24) < 2
+    
     const color = isCurrentHour 
       ? getColorForValue(trafficValue, 'traffic')
-      : { r: 100, g: 100, b: 150 }
+      : isNearHour
+        ? getColorForValue(trafficValue, 'traffic')
+        : { r: 80, g: 80, b: 120 }
 
-    const alpha = isCurrentHour ? 0.8 : 0.4
-
+    const alpha = isCurrentHour ? 0.9 : isNearHour ? 0.5 : 0.2
+    
     ctx.fillStyle = `rgba(${color.r}, ${color.g}, ${color.b}, ${alpha})`
-    ctx.fillRect(x + 2, maxBarHeight - barHeight, barWidth - 4, barHeight)
-
+    ctx.fillRect(x + 3, bottomY - barHeight, barWidth - 6, barHeight)
+    
+    if (isCurrentHour) {
+      const highlightGradient = ctx.createLinearGradient(x, bottomY - barHeight, x, bottomY)
+      highlightGradient.addColorStop(0, `rgba(255, 255, 255, 0.3)`)
+      highlightGradient.addColorStop(1, `rgba(255, 255, 255, 0)`)
+      ctx.fillStyle = highlightGradient
+      ctx.fillRect(x + 3, bottomY - barHeight, barWidth - 6, barHeight * 0.3)
+    }
+    
     if (hour % 6 === 0) {
-      ctx.fillStyle = 'rgba(255, 255, 255, 0.5)'
-      ctx.font = '10px sans-serif'
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.6)'
+      ctx.font = '11px sans-serif'
       ctx.textAlign = 'center'
-      ctx.fillText(`${hour}:00`, x + barWidth / 2, maxBarHeight + 15)
+      ctx.fillText(`${hour}:00`, x + barWidth / 2, bottomY + maxBarHeight + 15)
     }
   }
-
+  
   const currentX = hourProgress * 24 * barWidth + barWidth / 2
+  const arrowSize = 8
+  
   ctx.beginPath()
-  ctx.moveTo(currentX, -10)
-  ctx.lineTo(currentX - 5, 0)
-  ctx.lineTo(currentX + 5, 0)
+  ctx.moveTo(currentX, bottomY - maxBarHeight - 15)
+  ctx.lineTo(currentX - arrowSize, bottomY - maxBarHeight - 5)
+  ctx.lineTo(currentX + arrowSize, bottomY - maxBarHeight - 5)
   ctx.closePath()
-  ctx.fillStyle = 'rgba(255, 255, 255, 0.8)'
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.9)'
   ctx.fill()
-
+  
+  ctx.beginPath()
+  ctx.moveTo(currentX, bottomY - maxBarHeight - 15)
+  ctx.lineTo(currentX, bottomY)
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.5)'
+  ctx.lineWidth = 2
+  ctx.setLineDash([5, 5])
+  ctx.stroke()
+  ctx.setLineDash([])
+  
   ctx.restore()
 }
 
 const animate = () => {
-  if (!canvasContext || !particleSystem) {
+  if (!mainCtx || !trailCtx) {
     animationFrameId = requestAnimationFrame(animate)
     return
   }
 
-  const hourProgress = currentHour.value / 24
+  const dt = slowMotion.value ? 0.016 : 0.016 * 2
+  time += dt
   
+  const hourProgress = currentHour.value / 24
   const currentHourData = getInterpolatedData(currentHour.value)
   const trafficValue = currentHourData.traffic_index
   const aqiValue = currentHourData.aqi
-
-  canvasContext.clearRect(0, 0, particleSystem.width, particleSystem.height)
-
-  drawFluidEffect(canvasContext, hourProgress, trafficValue, aqiValue)
+  
+  trailCtx.clearRect(0, 0, canvasWidth, canvasHeight)
+  
+  trailCtx.fillStyle = 'rgba(10, 15, 30, 0.15)'
+  trailCtx.fillRect(0, 0, canvasWidth, canvasHeight)
+  
+  particles.forEach(particle => {
+    particle.update(hourProgress, trafficValue, aqiValue, dt)
+    particle.drawTrail(trailCtx)
+  })
+  
+  mainCtx.clearRect(0, 0, canvasWidth, canvasHeight)
+  
+  drawBackground(mainCtx, hourProgress, trafficValue, aqiValue)
+  
+  mainCtx.drawImage(trailCanvas.value, 0, 0)
+  
+  particles.forEach(particle => {
+    particle.drawParticle(mainCtx)
+  })
+  
+  drawTimeDistribution(mainCtx, hourProgress)
 
   animationFrameId = requestAnimationFrame(animate)
 }
@@ -440,13 +672,14 @@ const togglePlay = () => {
   isPlaying.value = !isPlaying.value
   
   if (isPlaying.value) {
+    const interval = slowMotion.value ? 200 : 100
     playInterval = setInterval(() => {
       currentHour.value += 0.1
       if (currentHour.value >= 24) {
         currentHour.value = 0
       }
       updateActiveStep()
-    }, 100)
+    }, interval)
   } else {
     if (playInterval) {
       clearInterval(playInterval)
@@ -455,11 +688,32 @@ const togglePlay = () => {
   }
 }
 
+const toggleSlowMotion = () => {
+  slowMotion.value = !slowMotion.value
+  
+  if (isPlaying.value && playInterval) {
+    clearInterval(playInterval)
+    const interval = slowMotion.value ? 200 : 100
+    playInterval = setInterval(() => {
+      currentHour.value += 0.1
+      if (currentHour.value >= 24) {
+        currentHour.value = 0
+      }
+      updateActiveStep()
+    }, interval)
+  }
+}
+
 const resetTimeline = () => {
   currentHour.value = 0
   if (isPlaying.value) {
     togglePlay()
   }
+  updateActiveStep()
+}
+
+const jumpToStep = (hour) => {
+  currentHour.value = hour
   updateActiveStep()
 }
 
@@ -479,16 +733,6 @@ const updateActiveStep = () => {
   activeStep.value = closestIndex
 }
 
-const handleScroll = () => {
-  if (!scrollContainer.value) return
-
-  const container = scrollContainer.value
-  const scrollProgress = container.scrollTop / (container.scrollHeight - container.clientHeight)
-  
-  currentHour.value = scrollProgress * 24
-  updateActiveStep()
-}
-
 watch(() => props.city, () => {
   loadData()
 })
@@ -505,19 +749,18 @@ onMounted(() => {
   })
 
   window.addEventListener('resize', () => {
-    if (particleCanvas.value) {
+    if (particleCanvas.value && trailCanvas.value) {
       const container = particleCanvas.value.parentElement
-      particleCanvas.value.width = container.clientWidth
-      particleCanvas.value.height = container.clientHeight
+      canvasWidth = container.clientWidth
+      canvasHeight = container.clientHeight
       
-      if (particleSystem) {
-        particleSystem.width = particleCanvas.value.width
-        particleSystem.height = particleCanvas.value.height
-        particleSystem.particles.forEach(p => {
-          p.canvasWidth = particleCanvas.value.width
-          p.canvasHeight = particleCanvas.value.height
-        })
-      }
+      particleCanvas.value.width = canvasWidth
+      particleCanvas.value.height = canvasHeight
+      trailCanvas.value.width = canvasWidth
+      trailCanvas.value.height = canvasHeight
+      
+      initVelocityField()
+      initParticles()
     }
   })
 })
@@ -559,23 +802,12 @@ onUnmounted(() => {
   gap: 15px;
   font-size: 0.95rem;
   color: rgba(255, 255, 255, 0.7);
-  position: relative;
-  padding: 5px 0;
 }
 
 .time-indicator .highlight {
   font-weight: bold;
   color: #667eea;
   font-size: 1.1rem;
-}
-
-.time-marker {
-  position: absolute;
-  bottom: 0;
-  width: 2px;
-  height: 3px;
-  background: #667eea;
-  transition: left 0.3s ease;
 }
 
 .scrollytelling-container {
@@ -595,6 +827,20 @@ onUnmounted(() => {
   width: 100%;
   height: 100%;
   display: block;
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 2;
+}
+
+.trail-canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 1;
 }
 
 .canvas-overlay {
@@ -604,6 +850,7 @@ onUnmounted(() => {
   right: 0;
   bottom: 0;
   pointer-events: none;
+  z-index: 3;
 }
 
 .current-hour-label {
@@ -614,6 +861,7 @@ onUnmounted(() => {
   font-weight: bold;
   color: rgba(255, 255, 255, 0.3);
   text-shadow: 0 0 20px rgba(102, 126, 234, 0.5);
+  font-family: 'Courier New', monospace;
 }
 
 .scroll-steps {
@@ -621,6 +869,7 @@ onUnmounted(() => {
   padding: 20px;
   overflow-y: auto;
   background: rgba(0, 0, 0, 0.3);
+  z-index: 10;
 }
 
 .step-section {
@@ -630,11 +879,18 @@ onUnmounted(() => {
   border-radius: 12px;
   border: 1px solid rgba(255, 255, 255, 0.1);
   transition: all 0.5s ease;
+  cursor: pointer;
+}
+
+.step-section:hover {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: rgba(255, 255, 255, 0.15);
 }
 
 .step-section.active {
   background: rgba(102, 126, 234, 0.15);
   border-color: rgba(102, 126, 234, 0.5);
+  transform: translateX(5px);
 }
 
 .step-content h3 {
@@ -695,8 +951,8 @@ onUnmounted(() => {
 
 .time-slider {
   width: 100%;
-  height: 6px;
-  border-radius: 3px;
+  height: 8px;
+  border-radius: 4px;
   background: rgba(255, 255, 255, 0.1);
   outline: none;
   -webkit-appearance: none;
@@ -705,17 +961,18 @@ onUnmounted(() => {
 
 .time-slider::-webkit-slider-thumb {
   -webkit-appearance: none;
-  width: 18px;
-  height: 18px;
+  width: 20px;
+  height: 20px;
   border-radius: 50%;
   background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
   cursor: pointer;
-  box-shadow: 0 0 10px rgba(102, 126, 234, 0.5);
-  transition: transform 0.2s ease;
+  box-shadow: 0 0 15px rgba(102, 126, 234, 0.6);
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
 }
 
 .time-slider::-webkit-slider-thumb:hover {
   transform: scale(1.2);
+  box-shadow: 0 0 25px rgba(102, 126, 234, 0.8);
 }
 
 .slider-labels {
@@ -732,7 +989,7 @@ onUnmounted(() => {
   justify-content: center;
 }
 
-.play-btn, .reset-btn {
+.play-btn, .reset-btn, .speed-btn {
   padding: 10px 25px;
   border-radius: 25px;
   border: none;
@@ -760,5 +1017,21 @@ onUnmounted(() => {
 .reset-btn:hover {
   background: rgba(255, 255, 255, 0.15);
   border-color: rgba(255, 255, 255, 0.3);
+}
+
+.speed-btn {
+  background: rgba(255, 255, 255, 0.05);
+  color: rgba(255, 255, 255, 0.7);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+}
+
+.speed-btn:hover {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.speed-btn.active {
+  background: rgba(102, 126, 234, 0.2);
+  border-color: rgba(102, 126, 234, 0.5);
+  color: #667eea;
 }
 </style>
