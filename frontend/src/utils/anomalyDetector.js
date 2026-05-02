@@ -2,7 +2,9 @@ export class AnomalyDetector {
   constructor(options = {}) {
     this.windowSize = options.windowSize || 10
     this.thresholdMultiplier = options.thresholdMultiplier || 2.5
+    this.cooldownPeriod = options.cooldownPeriod || 30000
     this.history = new Map()
+    this.lastAnomalyTime = new Map()
   }
 
   addDataPoint(key, value, metadata = {}) {
@@ -18,7 +20,17 @@ export class AnomalyDetector {
     }
   }
 
+  isInCooldown(key) {
+    const lastTime = this.lastAnomalyTime.get(key)
+    if (!lastTime) return false
+    return Date.now() - lastTime < this.cooldownPeriod
+  }
+
   detect(key) {
+    if (this.isInCooldown(key)) {
+      return null
+    }
+
     const data = this.history.get(key)
     if (!data || data.length < this.windowSize) {
       return null
@@ -33,6 +45,8 @@ export class AnomalyDetector {
     const zScore = deviation / (stdDev || 1)
 
     if (zScore > this.thresholdMultiplier) {
+      this.lastAnomalyTime.set(key, Date.now())
+      
       return {
         key,
         value: currentValue,
@@ -70,6 +84,7 @@ export class AnomalyDetector {
 
   clear() {
     this.history.clear()
+    this.lastAnomalyTime.clear()
   }
 }
 
