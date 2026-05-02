@@ -69,11 +69,16 @@ let renderer = null
 let controls = null
 let buildings = []
 let roads = []
-let particles = []
+let flowParticles = []
+let trailRenderTarget = null
+let trailScene = null
+let trailCamera = null
+let velocityField = null
 let rippleEffects = []
 let animationId = null
 let dataUpdateInterval = null
 let anomalyDetector = null
+let clock = null
 
 const cityConfigs = {
   '北京': {
@@ -101,6 +106,169 @@ const cityConfigs = {
     ]
   }
 }
+
+const roadFlowVertexShader = `
+  varying vec2 vUv;
+  varying vec3 vPosition;
+  
+  void main() {
+    vUv = uv;
+    vPosition = position;
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+  }
+`
+
+const roadFlowFragmentShader = `
+  uniform float time;
+  uniform float flowSpeed;
+  uniform float trafficIntensity;
+  uniform vec3 flowColor;
+  uniform float isHorizontal;
+  
+  varying vec2 vUv;
+  varying vec3 vPosition;
+  
+  float hash(vec2 p) {
+    return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+  }
+  
+  float noise(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    
+    float a = hash(i);
+    float b = hash(i + vec2(1.0, 0.0));
+    float c = hash(i + vec2(0.0, 1.0));
+    float d = hash(i + vec2(1.0, 1.0));
+    
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+  }
+  
+  float fbm(vec2 p) {
+    float value = 0.0;
+    float amplitude = 0.5;
+    float frequency = 1.0;
+    
+    for(int i = 0; i < 4; i++) {
+      value += amplitude * noise(p * frequency);
+      amplitude *= 0.5;
+      frequency *= 2.0;
+    }
+    return value;
+  }
+  
+  void main() {
+    vec2 flowCoord;
+    if (isHorizontal > 0.5) {
+      flowCoord = vec2(vUv.x * 20.0 - time * flowSpeed, vUv.y * 5.0);
+    } else {
+      flowCoord = vec2(vUv.y * 20.0 - time * flowSpeed, vUv.x * 5.0);
+    }
+    
+    float noise1 = fbm(flowCoord);
+    float noise2 = fbm(flowCoord + vec2(100.0));
+    
+    float flowPattern = noise1 * 0.7 + noise2 * 0.3;
+    
+    float lines = 0.0;
+    float lineSpacing = 0.15;
+    float lineWidth = 0.03;
+    float linePos = mod(flowCoord.x * 0.5, lineSpacing);
+    
+    if (linePos < lineWidth) {
+      float lineIntensity = smoothstep(lineWidth, 0.0, linePos) * 
+                            smoothstep(0.0, lineWidth * 0.3, linePos);
+      lines = lineIntensity * (0.5 + flowPattern * 0.5);
+    }
+    
+    float glowLines = 0.0;
+    float glowWidth = 0.06;
+    if (linePos < glowWidth) {
+      glowLines = smoothstep(glowWidth, 0.0, linePos) * 0.5;
+    }
+    
+    float baseRoad = 0.08;
+    float finalIntensity = baseRoad + lines * trafficIntensity + glowLines * trafficIntensity * 0.5;
+    
+    vec3 finalColor = mix(vec3(0.02, 0.02, 0.05), flowColor, finalIntensity);
+    
+    float alpha = 1.0;
+    
+    gl_FragColor = vec4(finalColor, alpha);
+  }
+`
+
+const trailVertexShader = `
+  attribute vec3 previous;
+  attribute vec3 next;
+  attribute float side;
+  attribute float width;
+  
+  uniform float pixelRatio;
+  
+  varying vec2 vUv;
+  varying float vCounters;
+  
+  void main() {
+    vUv = uv;
+    vCounters = uv.x;
+    
+    vec2 aspect = vec2(1.0, 1.0);
+    
+    vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+    vec4 mvPrevious = modelViewMatrix * vec4(previous, 1.0);
+    vec4 mvNext = modelViewMatrix * vec4(next, 1.0);
+    
+    vec2 currentProj = mvPosition.xy / mvPosition.w;
+    vec2 previousProj = mvPrevious.xy / mvPrevious.w;
+    vec2 nextProj = mvNext.xy / mvNext.w;
+    
+    vec2 screen = vec2(
+      projectionMatrix[0][0],
+      projectionMatrix[1][1]
+    );
+    
+    vec2 dir;
+    if (all(equal(position.xy, previous.xy))) {
+      dir = normalize(nextProj - currentProj);
+    } else if (all(equal(position.xy, next.xy))) {
+      dir = normalize(currentProj - previousProj);
+    } else {
+      vec2 dirA = normalize(currentProj - previousProj);
+      vec2 dirB = normalize(nextProj - currentProj);
+      dir = normalize(dirA + dirB);
+    }
+    
+    vec2 normal = vec2(-dir.y, dir.x);
+    normal *= width * 0.5 * pixelRatio;
+    normal.x /= screen.x;
+    normal.y /= screen.y;
+    
+    vec4 offset = vec4(normal * side, 0.0, 0.0);
+    gl_Position = mvPosition + offset;
+  }
+`
+
+const trailFragmentShader = `
+  uniform vec3 color;
+  uniform float alpha;
+  uniform float fadeIn;
+  uniform float fadeOut;
+  
+  varying vec2 vUv;
+  varying float vCounters;
+  
+  void main() {
+    float head = smoothstep(0.0, fadeIn, vUv.x);
+    float tail = 1.0 - smoothstep(1.0 - fadeOut, 1.0, vUv.x);
+    float center = 1.0 - abs(2.0 * vUv.y - 1.0);
+    
+    float finalAlpha = head * tail * center * alpha;
+    
+    gl_FragColor = vec4(color, finalAlpha);
+  }
+`
 
 const getTrafficClass = (value) => {
   if (!value) return ''
@@ -134,7 +302,117 @@ const getColorForValue = (value, type = 'traffic') => {
   }
 }
 
+const initVelocityField = () => {
+  velocityField = {
+    gridSize: 30,
+    cellSize: 4,
+    velocities: []
+  }
+  
+  for (let z = 0; z < velocityField.gridSize; z++) {
+    for (let x = 0; x < velocityField.gridSize; x++) {
+      const worldX = (x - velocityField.gridSize / 2) * velocityField.cellSize
+      const worldZ = (z - velocityField.gridSize / 2) * velocityField.cellSize
+      
+      let vx = 0
+      let vz = 0
+      
+      for (let i = -2; i <= 2; i++) {
+        const roadZ = i * 12
+        const distZ = Math.abs(worldZ - roadZ)
+        
+        if (distZ < 3) {
+          const influence = 1 - distZ / 3
+          const direction = i % 2 === 0 ? 1 : -1
+          vx += influence * direction * 2
+        }
+      }
+      
+      for (let i = -2; i <= 2; i++) {
+        const roadX = i * 12
+        const distX = Math.abs(worldX - roadX)
+        
+        if (distX < 3) {
+          const influence = 1 - distX / 3
+          const direction = i % 2 === 0 ? 1 : -1
+          vz += influence * direction * 2
+        }
+      }
+      
+      const angle = (x + z) * 0.1
+      vx += Math.sin(angle) * 0.5
+      vz += Math.cos(angle) * 0.5
+      
+      velocityField.velocities[z * velocityField.gridSize + x] = { vx, vz }
+    }
+  }
+}
+
+const getVelocityAt = (x, z, time) => {
+  if (!velocityField) return { vx: 0, vz: 0 }
+  
+  const gridX = Math.floor((x / velocityField.cellSize) + velocityField.gridSize / 2)
+  const gridZ = Math.floor((z / velocityField.cellSize) + velocityField.gridSize / 2)
+  
+  const clampedX = Math.max(0, Math.min(velocityField.gridSize - 1, gridX))
+  const clampedZ = Math.max(0, Math.min(velocityField.gridSize - 1, gridZ))
+  
+  const idx = clampedZ * velocityField.gridSize + clampedX
+  const baseVel = velocityField.velocities[idx] || { vx: 0, vz: 0 }
+  
+  const turbulenceX = Math.sin(time * 2 + x * 0.5) * 0.3
+  const turbulenceZ = Math.cos(time * 2 + z * 0.5) * 0.3
+  
+  return {
+    vx: baseVel.vx + turbulenceX,
+    vz: baseVel.vz + turbulenceZ
+  }
+}
+
+const createTrailGeometry = (maxLength) => {
+  const geometry = new THREE.BufferGeometry()
+  const positions = new Float32Array(maxLength * 3 * 2)
+  const previous = new Float32Array(maxLength * 3 * 2)
+  const next = new Float32Array(maxLength * 3 * 2)
+  const side = new Float32Array(maxLength * 2)
+  const uv = new Float32Array(maxLength * 2 * 2)
+  const indices = []
+  
+  for (let i = 0; i < maxLength; i++) {
+    side[i * 2] = -1
+    side[i * 2 + 1] = 1
+    
+    uv[i * 4] = i / (maxLength - 1)
+    uv[i * 4 + 1] = 0
+    uv[i * 4 + 2] = i / (maxLength - 1)
+    uv[i * 4 + 3] = 1
+    
+    if (i < maxLength - 1) {
+      const a = i * 2
+      const b = i * 2 + 1
+      const c = i * 2 + 2
+      const d = i * 2 + 3
+      
+      indices.push(a, b, c)
+      indices.push(b, d, c)
+    }
+  }
+  
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3))
+  geometry.setAttribute('previous', new THREE.BufferAttribute(previous, 3))
+  geometry.setAttribute('next', new THREE.BufferAttribute(next, 3))
+  geometry.setAttribute('side', new THREE.BufferAttribute(side, 1))
+  geometry.setAttribute('uv', new THREE.BufferAttribute(uv, 2))
+  geometry.setIndex(new THREE.BufferAttribute(new Uint16Array(indices), 1))
+  
+  geometry.drawRange.count = 0
+  
+  return geometry
+}
+
 const initScene = () => {
+  clock = new THREE.Clock()
+  
   const config = cityConfigs[props.city] || cityConfigs['北京']
   const width = container.value.clientWidth
   const height = container.value.clientHeight
@@ -184,10 +462,11 @@ const initScene = () => {
   pointLight2.position.set(15, 15, 15)
   scene.add(pointLight2)
 
+  initVelocityField()
   createGround(config)
   createRoads(config)
   createBuildings(config)
-  createParticles(config)
+  createFlowParticles(config)
 
   window.addEventListener('resize', onWindowResize)
 
@@ -212,26 +491,64 @@ const createGround = (config) => {
 }
 
 const createRoads = (config) => {
-  const roadMaterial = new THREE.MeshStandardMaterial({
-    color: 0x2a2a3e,
-    roughness: 0.9,
-    metalness: 0.1
-  })
-
+  roads = []
+  
   for (let i = 0; i < 5; i++) {
-    const roadGeometry = new THREE.BoxGeometry(55, 0.1, 2)
+    const roadMaterial = new THREE.ShaderMaterial({
+      uniforms: {
+        time: { value: 0 },
+        flowSpeed: { value: 1.0 },
+        trafficIntensity: { value: 0.5 },
+        flowColor: { value: new THREE.Color(0x00aaff) },
+        isHorizontal: { value: 1.0 }
+      },
+      vertexShader: roadFlowVertexShader,
+      fragmentShader: roadFlowFragmentShader,
+      side: THREE.DoubleSide
+    })
+
+    const roadGeometry = new THREE.BoxGeometry(55, 0.15, 2.5)
     const road = new THREE.Mesh(roadGeometry, roadMaterial)
-    road.position.set(0, 0.05, (i - 2) * 12)
+    road.position.set(0, 0.075, (i - 2) * 12)
     road.receiveShadow = true
     scene.add(road)
-    roads.push({ mesh: road, trafficFlow: 0.5, baseZ: (i - 2) * 12, direction: i % 2 === 0 ? 1 : -1 })
+    
+    roads.push({
+      mesh: road,
+      material: roadMaterial,
+      trafficFlow: 0.5,
+      baseZ: (i - 2) * 12,
+      direction: i % 2 === 0 ? 1 : -1,
+      isHorizontal: true
+    })
 
-    const roadGeometry2 = new THREE.BoxGeometry(2, 0.1, 55)
-    const road2 = new THREE.Mesh(roadGeometry2, roadMaterial)
-    road2.position.set((i - 2) * 12, 0.05, 0)
+    const roadMaterial2 = new THREE.ShaderMaterial({
+      uniforms: {
+        time: { value: 0 },
+        flowSpeed: { value: 1.0 },
+        trafficIntensity: { value: 0.5 },
+        flowColor: { value: new THREE.Color(0x00aaff) },
+        isHorizontal: { value: 0.0 }
+      },
+      vertexShader: roadFlowVertexShader,
+      fragmentShader: roadFlowFragmentShader,
+      side: THREE.DoubleSide
+    })
+
+    const roadGeometry2 = new THREE.BoxGeometry(2.5, 0.15, 55)
+    const road2 = new THREE.Mesh(roadGeometry2, roadMaterial2)
+    road2.position.set((i - 2) * 12, 0.075, 0)
     road2.receiveShadow = true
     scene.add(road2)
-    roads.push({ mesh: road2, trafficFlow: 0.5, baseX: (i - 2) * 12, direction: i % 2 === 0 ? 1 : -1 })
+    
+    roads.push({
+      mesh: road2,
+      material: roadMaterial2,
+      trafficFlow: 0.5,
+      baseX: (i - 2) * 12,
+      direction: i % 2 === 0 ? 1 : -1,
+      isHorizontal: false
+    })
   }
 
   createRoadLights()
@@ -343,35 +660,103 @@ const createWindows = (width, height, depth, x, z, buildingHeight) => {
   return windows
 }
 
-const createParticles = (config) => {
-  particles = []
+const createFlowParticles = (config) => {
+  flowParticles = []
   
-  for (let i = 0; i < 200; i++) {
-    const particleGeometry = new THREE.SphereGeometry(0.05, 4, 4)
-    const particleMaterial = new THREE.MeshBasicMaterial({
-      color: 0x66aaff,
-      transparent: true,
-      opacity: 0.6
-    })
-
-    const particle = new THREE.Mesh(particleGeometry, particleMaterial)
-    particle.position.set(
-      (Math.random() - 0.5) * 50,
-      0.1 + Math.random() * 5,
-      (Math.random() - 0.5) * 50
-    )
-
-    scene.add(particle)
-
-    particles.push({
-      mesh: particle,
-      velocity: {
-        x: (Math.random() - 0.5) * 0.05,
-        z: (Math.random() - 0.5) * 0.05
+  const particleCount = 300
+  const trailLength = 30
+  
+  for (let i = 0; i < particleCount; i++) {
+    const x = (Math.random() - 0.5) * 55
+    const z = (Math.random() - 0.5) * 55
+    const y = 0.15 + Math.random() * 0.5
+    
+    const hue = 0.5 + Math.random() * 0.2
+    const color = new THREE.Color()
+    color.setHSL(hue, 0.8, 0.6)
+    
+    const trailGeometry = createTrailGeometry(trailLength)
+    
+    const trailMaterial = new THREE.ShaderMaterial({
+      uniforms: {
+        color: { value: color },
+        alpha: { value: 0.8 },
+        fadeIn: { value: 0.1 },
+        fadeOut: { value: 0.3 },
+        pixelRatio: { value: renderer ? renderer.getPixelRatio() : 1 }
       },
-      baseY: particle.position.y
+      vertexShader: trailVertexShader,
+      fragmentShader: trailFragmentShader,
+      transparent: true,
+      side: THREE.DoubleSide,
+      depthWrite: false
+    })
+    
+    const trail = new THREE.Mesh(trailGeometry, trailMaterial)
+    scene.add(trail)
+    
+    const positions = []
+    for (let j = 0; j < trailLength; j++) {
+      positions.push(new THREE.Vector3(x, y, z))
+    }
+    
+    flowParticles.push({
+      position: new THREE.Vector3(x, y, z),
+      velocity: { vx: 0, vz: 0 },
+      trail: trail,
+      trailGeometry: trailGeometry,
+      trailPositions: positions,
+      baseY: y,
+      color: color,
+      size: 0.08 + Math.random() * 0.06,
+      speedMultiplier: 0.5 + Math.random() * 0.5
     })
   }
+}
+
+const updateTrailGeometry = (particle) => {
+  const geometry = particle.trailGeometry
+  const positions = geometry.attributes.position.array
+  const previous = geometry.attributes.previous.array
+  const next = geometry.attributes.next.array
+  
+  const trailPositions = particle.trailPositions
+  const count = trailPositions.length
+  
+  for (let i = 0; i < count; i++) {
+    const pos = trailPositions[i]
+    const idx = i * 6
+    
+    positions[idx] = pos.x
+    positions[idx + 1] = pos.y
+    positions[idx + 2] = pos.z
+    positions[idx + 3] = pos.x
+    positions[idx + 4] = pos.y
+    positions[idx + 5] = pos.z
+    
+    const prevIdx = Math.max(0, i - 1)
+    const prevPos = trailPositions[prevIdx]
+    previous[idx] = prevPos.x
+    previous[idx + 1] = prevPos.y
+    previous[idx + 2] = prevPos.z
+    previous[idx + 3] = prevPos.x
+    previous[idx + 4] = prevPos.y
+    previous[idx + 5] = prevPos.z
+    
+    const nextIdx = Math.min(count - 1, i + 1)
+    const nextPos = trailPositions[nextIdx]
+    next[idx] = nextPos.x
+    next[idx + 1] = nextPos.y
+    next[idx + 2] = nextPos.z
+    next[idx + 3] = nextPos.x
+    next[idx + 4] = nextPos.y
+    next[idx + 5] = nextPos.z
+  }
+  
+  geometry.attributes.position.needsUpdate = true
+  geometry.attributes.previous.needsUpdate = true
+  geometry.attributes.next.needsUpdate = true
+  geometry.drawRange.count = (count - 1) * 6
 }
 
 const updateBuildingsVisuals = () => {
@@ -423,26 +808,64 @@ const animateRoads = (time) => {
       road.trafficFlow = currentData.value.traffic_index / 100
     }
 
-    const intensity = 0.5 + Math.sin(time * 2 + index) * 0.3 * road.trafficFlow
-    road.mesh.material.emissive = new THREE.Color(0x0066ff)
-    road.mesh.material.emissiveIntensity = intensity * 0.2
+    const flowSpeed = 0.5 + road.trafficFlow * 2.0
+    const trafficColor = getColorForValue(road.trafficFlow * 100, 'traffic')
+    
+    road.material.uniforms.time.value = time * road.direction
+    road.material.uniforms.flowSpeed.value = flowSpeed
+    road.material.uniforms.trafficIntensity.value = road.trafficFlow
+    road.material.uniforms.flowColor.value = trafficColor
   })
 }
 
-const animateParticles = (time) => {
-  particles.forEach((particle, index) => {
-    particle.mesh.position.x += particle.velocity.x
-    particle.mesh.position.z += particle.velocity.z
-
-    particle.mesh.position.y = particle.baseY + Math.sin(time * 2 + index) * 0.5
-
-    if (particle.mesh.position.x > 25) particle.mesh.position.x = -25
-    if (particle.mesh.position.x < -25) particle.mesh.position.x = 25
-    if (particle.mesh.position.z > 25) particle.mesh.position.z = -25
-    if (particle.mesh.position.z < -25) particle.mesh.position.z = 25
-
-    const pulse = 0.5 + Math.sin(time * 3 + index * 0.1) * 0.3
-    particle.mesh.material.opacity = pulse * 0.6
+const animateFlowParticles = (time, deltaTime) => {
+  if (!velocityField) return
+  
+  const trafficMultiplier = currentData.value ? (0.3 + currentData.value.traffic_index / 100) : 0.8
+  
+  flowParticles.forEach(particle => {
+    const velocity = getVelocityAt(
+      particle.position.x, 
+      particle.position.z, 
+      time
+    )
+    
+    particle.velocity.vx += velocity.vx * deltaTime * 2
+    particle.velocity.vz += velocity.vz * deltaTime * 2
+    
+    const friction = 0.95
+    particle.velocity.vx *= friction
+    particle.velocity.vz *= friction
+    
+    const maxSpeed = 3 * trafficMultiplier * particle.speedMultiplier
+    const currentSpeed = Math.sqrt(particle.velocity.vx ** 2 + particle.velocity.vz ** 2)
+    if (currentSpeed > maxSpeed) {
+      const scale = maxSpeed / currentSpeed
+      particle.velocity.vx *= scale
+      particle.velocity.vz *= scale
+    }
+    
+    particle.position.x += particle.velocity.vx * deltaTime
+    particle.position.z += particle.velocity.vz * deltaTime
+    
+    particle.position.y = particle.baseY + Math.sin(time * 2 + particle.position.x * 0.5) * 0.15
+    
+    if (particle.position.x > 28) particle.position.x = -28
+    if (particle.position.x < -28) particle.position.x = 28
+    if (particle.position.z > 28) particle.position.z = -28
+    if (particle.position.z < -28) particle.position.z = 28
+    
+    particle.trailPositions.pop()
+    particle.trailPositions.unshift(particle.position.clone())
+    
+    updateTrailGeometry(particle)
+    
+    const speed = Math.sqrt(particle.velocity.vx ** 2 + particle.velocity.vz ** 2)
+    const speedFactor = Math.min(1, speed / 2)
+    particle.trail.material.uniforms.alpha.value = 0.3 + speedFactor * 0.5
+    
+    const hue = 0.5 + speedFactor * 0.15
+    particle.trail.material.uniforms.color.value.setHSL(hue, 0.8, 0.5 + speedFactor * 0.2)
   })
 }
 
@@ -493,7 +916,8 @@ const animateRipples = () => {
 const animate = () => {
   animationId = requestAnimationFrame(animate)
 
-  const time = Date.now() * 0.001
+  const time = clock.getElapsedTime()
+  const deltaTime = clock.getDelta()
 
   if (autoRotate.value && controls) {
     controls.autoRotate = true
@@ -504,7 +928,7 @@ const animate = () => {
 
   animateBuildings()
   animateRoads(time)
-  animateParticles(time)
+  animateFlowParticles(time, deltaTime)
   animateRipples()
 
   if (controls) {
@@ -607,7 +1031,8 @@ watch(() => props.city, (newCity, oldCity) => {
 onMounted(() => {
   anomalyDetector = new AnomalyDetector({
     windowSize: 10,
-    thresholdMultiplier: 2.5
+    thresholdMultiplier: 2.5,
+    cooldownPeriod: 30000
   })
 
   initScene()
